@@ -3,6 +3,10 @@ import torch
 import numpy as np
 import traceback
 import logging
+import warnings
+import librosa
+import soundfile as sf
+import audioread
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 from scipy.spatial.distance import cosine
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status, BackgroundTasks
@@ -34,7 +38,7 @@ THRESHOLDS = {
 }
 
 # Directory where embeddings are stored
-EMBEDDINGS_DIR = r'C:\Users\parth\Downloads\PRAC\Phonics\ProdCODE\embeddings'
+EMBEDDINGS_DIR = os.environ.get("EMBEDDINGS_DIR", "embeddings")
 
 
 # === PYDANTIC MODELS ===
@@ -168,7 +172,8 @@ model_manager = ModelManager()
 
 
 # === AUDIO PROCESSING FUNCTIONS ===
-def trim_silence(audio_np, sr, top_db=20):
+def trim_silence(audio_np, top_db=20):
+    """Trim silence from audio using librosa"""
     try:
         logger.debug(f"Trimming silence from audio, shape before: {audio_np.shape}")
         trimmed_audio, _ = librosa.effects.trim(audio_np, top_db=top_db)
@@ -181,6 +186,7 @@ def trim_silence(audio_np, sr, top_db=20):
 
 
 def rms_normalize(audio_np):
+    """Normalize audio by RMS value"""
     try:
         logger.debug(f"Normalizing audio, shape: {audio_np.shape}")
         rms = np.sqrt(np.mean(audio_np ** 2))
@@ -211,81 +217,65 @@ def preprocess_audio(path, target_sr=16000):
         error_msg = f"Audio file not found: {path}"
         logger.error(error_msg)
         raise FileNotFoundError(error_msg)
-        
-    # First try directly with audioread to avoid the warnings from librosa
-    try:
-        logger.info("Attempting to load audio with audioread directly")
-        import audioread
-        import numpy as np
-        
-        with audioread.audio_open(path) as audio_file:
-            sr = audio_file.samplerate
-            logger.info(f"Audio file opened successfully with audioread. Sample rate: {sr}, Channels: {audio_file.channels}")
-            
-            # Read audio data
-            audio_data = []
-            total_bytes = 0
-            for block in audio_file:
-                block_data = np.frombuffer(block, dtype=np.int16)
-                audio_data.append(block_data)
-                total_bytes += len(block)
-            
-            if not audio_data:
-                logger.warning("Audio file appears to be empty")
-                raise ValueError("Empty audio file")
-                
-            audio_np = np.concatenate(audio_data).astype(np.float32) / 32768.0  # Convert to float32 and normalize
-            logger.info(f"Audio data loaded: {total_bytes} bytes, resulting shape: {audio_np.shape}")
-            
-            # Convert stereo to mono if needed
-            if len(audio_np.shape) > 1 and audio_np.shape[1] > 1:
-                logger.info(f"Converting stereo to mono, shape before: {audio_np.shape}")
-                audio_np = np.mean(audio_np, axis=1)
-                logger.info(f"Shape after conversion to mono: {audio_np.shape}")
     
-    except Exception as e:
-        # If audioread fails, fall back to librosa but suppress warnings
-        logger.warning(f"Failed to load with audioread: {str(e)}. Falling back to librosa.")
-        logger.warning(traceback.format_exc())
+    # First try with soundfile as it's most reliable for WAV
+    audio_np = None
+    sr = None
+    
+    try:
+        # Try with soundfile first (best for WAV)
+        logger.info("Attempting to load audio with soundfile")
+        data, sr = sf.read(path)
+        logger.info(f"Successfully loaded with soundfile. Shape: {data.shape}, Sample rate: {sr}")
+        audio_np = data.astype(np.float32)
+        
+        # Convert stereo to mono if needed
+        if len(audio_np.shape) > 1 and audio_np.shape[1] > 1:
+            logger.info(f"Converting stereo to mono, shape before: {audio_np.shape}")
+            audio_np = np.mean(audio_np, axis=1)
+            logger.info(f"Shape after conversion to mono: {audio_np.shape}")
+            
+    except Exception as sf_error:
+        logger.warning(f"Soundfile loading failed: {str(sf_error)}. Trying librosa.")
         
         try:
-            # Try to load with a custom loader to avoid warnings
-            logger.info("Attempting to load with custom soundfile loader")
-            import soundfile as sf
+            # Suppress warnings from librosa
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                logger.info("Loading with librosa (warnings suppressed)")
+                audio_np, sr = librosa.load(path, sr=None, mono=True)
+                logger.info(f"Successfully loaded with librosa. Shape: {audio_np.shape}, Sample rate: {sr}")
+                
+        except Exception as librosa_error:
+            logger.warning(f"Librosa loading failed: {str(librosa_error)}. Trying audioread as last resort.")
             
             try:
-                data, sr = sf.read(path)
-                logger.info(f"Successfully loaded with soundfile. Shape: {data.shape}, Sample rate: {sr}")
-                audio_np = data.astype(np.float32)
-                
-                # Convert stereo to mono if needed
-                if len(audio_np.shape) > 1 and audio_np.shape[1] > 1:
-                    logger.info(f"Converting stereo to mono, shape before: {audio_np.shape}")
-                    audio_np = np.mean(audio_np, axis=1)
-                    logger.info(f"Shape after conversion to mono: {audio_np.shape}")
-            
-            except Exception as sf_error:
-                logger.warning(f"Soundfile loading failed: {str(sf_error)}. Trying librosa as last resort.")
-                
-                # If soundfile also fails, use librosa as last resort
-                import warnings
-                import librosa
-                
-                # Temporarily suppress warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    logger.info("Loading with librosa (warnings suppressed)")
-                    audio_np, sr = librosa.load(path, sr=None, mono=True)
-                    logger.info(f"Successfully loaded with librosa. Shape: {audio_np.shape}, Sample rate: {sr}")
-        
-        except Exception as final_error:
-            error_msg = f"All audio loading methods failed: {str(final_error)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            raise RuntimeError(error_msg) from final_error
+                # Try with audioread as last resort
+                with audioread.audio_open(path) as audio_file:
+                    sr = audio_file.samplerate
+                    logger.info(f"Audio file opened with audioread. Sample rate: {sr}, Channels: {audio_file.channels}")
+                    
+                    # Read audio data
+                    audio_data = []
+                    for block in audio_file:
+                        block_data = np.frombuffer(block, dtype=np.int16)
+                        audio_data.append(block_data)
+                    
+                    if not audio_data:
+                        logger.warning("Audio file appears to be empty")
+                        raise ValueError("Empty audio file")
+                        
+                    audio_np = np.concatenate(audio_data).astype(np.float32) / 32768.0  # Convert to float32 and normalize
+                    logger.info(f"Audio data loaded with audioread, shape: {audio_np.shape}")
+                    
+            except Exception as final_error:
+                error_msg = f"All audio loading methods failed: {str(final_error)}"
+                logger.error(error_msg)
+                logger.error(traceback.format_exc())
+                raise RuntimeError(error_msg) from final_error
     
     # Check if we have valid audio data
-    if len(audio_np) == 0:
+    if audio_np is None or len(audio_np) == 0:
         error_msg = "Audio file contains no data"
         logger.error(error_msg)
         raise ValueError(error_msg)
@@ -294,45 +284,35 @@ def preprocess_audio(path, target_sr=16000):
     logger.info(f"Audio statistics - Min: {audio_np.min():.4f}, Max: {audio_np.max():.4f}, Mean: {audio_np.mean():.4f}, RMS: {np.sqrt(np.mean(audio_np**2)):.4f}")
     
     # Resample if needed
-    try:
-        if sr != target_sr:
-            logger.info(f"Resampling from {sr} Hz to {target_sr} Hz")
-            import librosa
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=target_sr)
-            logger.info(f"Resampling complete. New shape: {audio_np.shape}")
-    except Exception as e:
-        error_msg = f"Resampling failed: {str(e)}"
-        logger.error(error_msg)
-        logger.error(traceback.format_exc())
-        raise RuntimeError(error_msg) from e
-            
-    # Apply processing
-    try:
-        import librosa
+    if sr != target_sr:
+        logger.info(f"Resampling from {sr} Hz to {target_sr} Hz")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=target_sr)
+        logger.info(f"Resampling complete. New shape: {audio_np.shape}")
             
-            # Trim silence
-            logger.info("Trimming silence")
-            start_shape = audio_np.shape
-            audio_np, trim_indices = librosa.effects.trim(audio_np, top_db=20)
-            logger.info(f"Silence trimming: shape changed from {start_shape} to {audio_np.shape}. Trim indices: {trim_indices}")
-            
-            # Normalize
-            logger.info("Performing RMS normalization")
-            rms = np.sqrt(np.mean(audio_np ** 2))
-            if rms < 1e-6:
-                logger.warning(f"Very low RMS value detected: {rms}. Audio might be too quiet.")
-            audio_np = audio_np / (rms + 1e-6)
-            logger.info(f"After normalization - Min: {audio_np.min():.4f}, Max: {audio_np.max():.4f}, RMS: {np.sqrt(np.mean(audio_np**2)):.4f}")
+    # Apply processing - trim silence and normalize
+    try:
+        # Trim silence
+        logger.info("Trimming silence")
+        start_shape = audio_np.shape
+        audio_np, trim_indices = librosa.effects.trim(audio_np, top_db=20)
+        logger.info(f"Silence trimming: shape changed from {start_shape} to {audio_np.shape}. Trim indices: {trim_indices}")
+        
+        # Normalize
+        logger.info("Performing RMS normalization")
+        rms = np.sqrt(np.mean(audio_np ** 2))
+        if rms < 1e-6:
+            logger.warning(f"Very low RMS value detected: {rms}. Audio might be too quiet.")
+        audio_np = audio_np / (rms + 1e-6)
+        logger.info(f"After normalization - Min: {audio_np.min():.4f}, Max: {audio_np.max():.4f}, RMS: {np.sqrt(np.mean(audio_np**2)):.4f}")
     
-    except Exception as e:
-        error_msg = f"Audio processing failed: {str(e)}"
+    except Exception as proc_error:
+        error_msg = f"Audio processing failed: {str(proc_error)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
-        raise RuntimeError(error_msg) from e
+        # Continue with unprocessed audio if processing fails
+        logger.warning("Continuing with unprocessed audio")
     
     # Convert to torch tensor
     try:
@@ -344,6 +324,7 @@ def preprocess_audio(path, target_sr=16000):
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         raise RuntimeError(error_msg) from e
+
 
 # === DEPENDENCY ===
 def get_model_manager():
@@ -524,5 +505,4 @@ async def health_check(model_manager: ModelManager = Depends(get_model_manager))
 
 if __name__ == "__main__":
     import uvicorn
-
-    # Start server
+    uvicorn.run(app, host="0.0.0.0", port=8000)
